@@ -1,0 +1,1307 @@
+from collections import deque
+##批量选择
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from imblearn.over_sampling import SMOTE
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import chi2_contingency
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors, KernelDensity
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, recall_score, confusion_matrix, precision_score, f1_score
+from sklearn.datasets import fetch_openml
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Normal, MultivariateNormal
+import os
+from scipy import stats
+import requests
+from io import BytesIO
+import zipfile
+import warnings
+from typing import List, Dict, Tuple, Optional, Union
+import seaborn as sns
+from sklearn.impute import SimpleImputer
+from scipy.interpolate import UnivariateSpline
+from scipy.stats import entropy
+from collections import Counter
+import random
+
+
+
+# 设置随机种子确保结果可复现
+np.random.seed(42)
+torch.manual_seed(42)
+
+# 忽略警告
+warnings.filterwarnings('ignore')
+
+
+class DataProcessor:
+    """数据处理类，负责数据加载、基础数据选取和归一化"""
+
+    # "D:\projects\pythonProject\cm1.csv"
+    # r"D:\projects\pythonProject\PROMISE-backup-master\PROMISE-backup-master\bug-source_data\jedit\jedit-3.2.csv"
+    def __init__(self, data_path: str = r"D:\projects\pythonProject\PROMISE-backup-master\PROMISE-backup-master\bug-source_data\camel\camel-1.2.csv", dataset_name: str = None):
+        """
+        初始化数据处理器
+
+        参数:
+            data_path: 数据路径，如果为None则从Promise数据集下载
+            dataset_name: 要使用的Promise数据集名称，如"cm1", "jm1"等
+        """
+        self.data_path = data_path
+        self.dataset_name = dataset_name
+        self.data = None
+        self.X = None
+        self.X_train = None
+        self.X_test = None
+        self.y_train = None
+        self.y_test = None
+        self.scaler = StandardScaler()
+
+    def load_data(self) -> pd.DataFrame:
+        """加载Promise数据集"""
+        if self.data_path:
+            # 从本地加载数据
+            self.data = pd.read_csv(self.data_path)
+            self.data = self.data.drop(['name'], axis=1)
+            self.data['bug'] = self.data['bug'].apply(lambda x: 1 if x > 1 else x)
+        else:
+            # 从Promise数据集下载
+            Data = fetch_openml(name=self.dataset_name, version=1, as_frame=True)
+            X = pd.DataFrame(Data.data, columns=Data.feature_names)
+            Y = Data.target
+
+            # 自动检测并转换目标变量格式
+            Y = self._convert_target_variable(Y)
+
+            # 合并特征和目标变量
+            self.data = pd.concat([X, Y], axis=1)
+
+        print(f"数据加载完成，形状: {self.data.shape}")
+        return self.data
+
+    def _convert_target_variable(self, Y: pd.Series) -> pd.Series:
+        """
+        自动检测并转换目标变量格式为0/1
+
+        参数:
+            Y: 目标变量Series
+
+        返回:
+            转换为0/1格式的目标变量Series
+        """
+        # 获取唯一值并转换为小写
+        unique_values = Y.unique()
+        unique_values_lower = [str(val).lower() for val in unique_values]
+
+        # 检查常见的二元分类标签格式
+        if set(unique_values_lower) == {'yes', 'no'}:
+            print("检测到yes/no格式，转换为0/1")
+            return Y.map({'yes': 1, 'no': 0, 'YES': 1, 'NO': 0, 'Yes': 1, 'No': 0})
+        elif set(unique_values_lower) == {'true', 'false'}:
+            print("检测到true/false格式，转换为0/1")
+            return Y.map({'true': 1, 'false': 0, 'TRUE': 1, 'FALSE': 0, 'True': 1, 'False': 0})
+        elif set(unique_values_lower) == {'1', '0'}:
+            print("检测到1/0格式，直接转换为数值类型")
+            return Y.astype(int)
+        elif set(unique_values_lower) == {'1', '0', 'yes', 'no'}:  # 处理混合格式
+            print("检测到混合格式，转换为0/1")
+            return Y.map({'yes': 1, 'no': 0, 'YES': 1, 'NO': 0, 'Yes': 1, 'No': 0, '1': 1, '0': 0})
+        elif set(unique_values_lower) == {'1', '0', 'true', 'false'}:  # 处理混合格式
+            print("检测到混合格式，转换为0/1")
+            return Y.map({'true': 1, 'false': 0, 'TRUE': 1, 'FALSE': 0, 'True': 1, 'False': 0, '1': 1, '0': 0})
+        else:
+            print(f"警告: 无法识别目标变量格式，唯一值: {unique_values}")
+            print("将尝试直接转换为数值类型，可能会导致错误")
+            try:
+                return Y.astype(int)
+            except:
+                print("错误: 无法将目标变量转换为数值类型")
+                print("请检查数据集或手动指定目标变量转换方式")
+                return Y
+
+    def prepare_data(self, test_size: float = 1 / 9, random_state: int = 42) -> None:
+        """
+        准备训练集和测试集
+
+        参数:
+            test_size: 测试集比例
+            random_state: 随机种子
+        """
+        if self.data is None:
+            raise ValueError("请先加载数据")
+
+        # 假设最后一列是目标变量
+        target_column = self.data.columns[-1]
+        feature_columns = [col for col in self.data.columns if col != target_column]
+
+        X = self.data[feature_columns].values
+        X = self.scaler.fit_transform(X)
+        self.X = X
+        y = self.data[target_column].values
+        # 使用SMOTE处理不平衡
+        # smote = SMOTE(random_state=42)
+        # X, y = smote.fit_resample(X, y)
+
+        # 分割数据集
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+
+        print(f"训练集大小: {self.X_train.shape}, 测试集大小: {self.X_test.shape}")
+
+        X_half1, X_half2, y_half1, y_half2 = train_test_split(
+            self.X_train, self.y_train, test_size=0.5, random_state=42  # random_state确保结果可复现
+        )
+        # 统计训练集和测试集中的缺陷样本数量
+        train_defect_count = np.sum(self.y_train == 1)
+        test_defect_count = np.sum(self.y_test == 1)
+        half_train_defect_count = np.sum(y_half1 == 1)
+
+        print(f"训练集中的缺陷样本比例: {train_defect_count}/{len(self.y_train)}")
+        print(f"测试集中的缺陷样本比例: {test_defect_count}/{len(self.y_test)}")
+
+
+class NormalizingFlow(nn.Module):
+    """归一化流模型，用于将复杂数据分布转换为简单分布，支持GPU加速"""
+
+    def __init__(self, dim: int, num_layers: int = 5, device=None):
+        """
+        初始化归一化流模型
+
+        参数:
+            dim: 数据维度
+            num_layers: 流层数
+            device: 计算设备 (cuda或cpu)，默认自动选择
+        """
+        super().__init__()
+        self.dim = dim
+        self.num_layers = num_layers
+        # 自动选择设备（优先GPU）
+        self.device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        # 创建变换层并移动到指定设备
+        self.transforms = nn.ModuleList([self._create_transform(dim) for _ in range(num_layers)])
+        self.to(self.device)  # 将模型参数移动到设备
+
+        # 创建基础分布并确保其参数在正确设备上
+        self.base_dist = MultivariateNormal(
+            torch.zeros(dim, device=self.device),  # 均值向量
+            torch.eye(dim, device=self.device)  # 协方差矩阵
+        )
+
+    def _create_transform(self, dim: int) -> nn.Module:
+        """创建单个流变换层并移动到指定设备"""
+        # 使用仿射耦合层，并确保它在正确的设备上
+        return AffineCouplingLayer(dim, device=self.device)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播，将数据从复杂分布转换为简单分布
+        参数:
+            x: 输入数据（会自动迁移到模型所在设备）
+
+        返回:
+            z: 转换后的数据
+            log_det: 对数行列式
+        """
+        # 确保输入数据在正确的设备上
+        x = x.to(self.device)
+        z = x
+        # 确保log_det在正确的设备上
+        log_det = torch.zeros(z.shape[0], device=self.device)
+
+        for transform in self.transforms:
+            z, ld = transform(z)
+            log_det += ld
+
+        return z, log_det
+
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        反向传播，将简单分布转换为复杂分布
+        参数:
+            z: 来自简单分布的数据（会自动迁移到模型所在设备）
+
+        返回:
+            x: 转换后的复杂分布数据
+        """
+        # 确保输入数据在正确的设备上
+        z = z.to(self.device)
+        x = z
+
+        for transform in reversed(self.transforms):
+            x = transform.inverse(x)
+
+        return x
+
+    def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        计算输入数据的对数概率
+        参数:
+            x: 输入数据（会自动迁移到模型所在设备）
+
+        返回:
+            log_prob: 对数概率
+        """
+        z, log_det = self.forward(x)
+        log_prob = self.base_dist.log_prob(z) + log_det
+        return log_prob
+
+
+class AffineCouplingLayer(nn.Module):
+    """仿射耦合层，归一化流中的一种常用变换，支持GPU加速"""
+
+    def __init__(self, dim: int, hidden_dim: int = 64, device=None):
+        """
+        初始化仿射耦合层
+        参数:
+            dim: 数据维度
+            hidden_dim: 隐藏层维度
+            device: 计算设备 (cuda或cpu)，默认自动选择
+        """
+        super().__init__()
+        self.dim = dim
+        # 自动选择设备（优先GPU）
+        self.device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        # 创建掩码并移动到指定设备
+        self.mask = self._create_mask(dim).to(self.device)
+
+        # 计算分割点
+        split_dim = dim // 2
+
+        # 创建s和t网络
+        self.s_net = nn.Sequential(
+            nn.Linear(split_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, dim - split_dim),
+            nn.Tanh()
+        )
+
+        self.t_net = nn.Sequential(
+            nn.Linear(split_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, dim - split_dim)
+        )
+
+        # 将网络移动到指定设备
+        self.to(self.device)
+
+    def _create_mask(self, dim: int) -> torch.Tensor:
+        """创建掩码，将输入分为两部分"""
+        mask = torch.zeros(dim)
+        split_dim = dim // 2
+        mask[:split_dim] = 1
+        return mask
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播
+        参数:
+            x: 输入数据（会自动迁移到层所在设备）
+
+        返回:
+            z: 转换后的数据
+            log_det: 对数行列式
+        """
+        # 确保输入数据在正确的设备上
+        x = x.to(self.device)
+
+        # 应用掩码
+        split_dim = self.dim // 2
+        x0 = x[:, :split_dim]
+        x1 = x[:, split_dim:]
+
+        # 计算s和t
+        s = self.s_net(x0)
+        t = self.t_net(x0)
+
+        # 应用变换
+        z1 = x1 * torch.exp(s) + t
+        z = torch.cat([x0, z1], dim=1)
+
+        # 计算对数行列式
+        log_det = torch.sum(s, dim=1)
+
+        return z, log_det
+
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        反向传播
+        参数:
+            z: 输入数据（会自动迁移到层所在设备）
+
+        返回:
+            x: 转换后的数据
+        """
+        # 确保输入数据在正确的设备上
+        z = z.to(self.device)
+
+        # 应用掩码
+        split_dim = self.dim // 2
+        z0 = z[:, :split_dim]
+        z1 = z[:, split_dim:]
+
+        # 计算s和t
+        s = self.s_net(z0)
+        t = self.t_net(z0)
+
+        # 应用逆变换
+        x1 = (z1 - t) * torch.exp(-s)
+        x = torch.cat([z0, x1], dim=1)
+
+        return x
+
+
+# 定义DQN网络
+class DQN(nn.Module):
+    def __init__(self, input_dim, output_dim, device):
+        super(DQN, self).__init__()
+        self.device = device  # 保存设备信息
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, output_dim)
+        self.to(device)  # 初始化时就迁移到指定设备
+
+    def forward(self, x):
+        x = x.to(self.device)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+# 定义强化学习环境
+class WeightOptimizationEnv:
+    def __init__(self, X_pool, y_pool, X_test, weights, num_samples, batch_size=3, device=None):
+        """
+        初始化权重优化环境，支持GPU加速
+
+        参数:
+            X_pool: 数据池
+            y_pool: 数据池标签
+            X_test: 测试数据
+            weights: 特征权重
+            num_samples: 要选择的样本数
+            batch_size: 批次大小
+            device: 计算设备 (cuda或cpu)，默认自动选择
+        """
+        self.X_pool = X_pool
+        self.y_pool = y_pool
+        self.X_test = X_test
+        self.weights = weights
+        self.num_samples = num_samples
+        self.selected_indices = []
+        self.state = np.zeros(len(X_pool))
+        self.action_space = len(X_pool)
+        self.batch_size = batch_size
+        self.observation_space = len(X_pool)
+
+        # 设备管理，与其他组件保持一致
+        self.device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        print(f"WeightOptimizationEnv 使用设备: {self.device}")
+
+        # 初始化分布分析器，确保使用相同设备
+        self.analyzer = DistributionAnalyzer(device=self.device)
+
+    def step(self, action):
+        # 检查无效动作（重复选择）
+        invalid = [a for a in action if a in self.selected_indices]
+        if invalid:
+            reward = -len(invalid)  # 重复样本越多，惩罚越大
+        else:
+            # 添加新选择的样本
+            self.selected_indices.extend(action)
+            # 截断超出数量的选择
+            if len(self.selected_indices) > self.num_samples:
+                self.selected_indices = self.selected_indices[:self.num_samples]
+
+            # 计算选中样本与测试集的分布差异
+            X_selected = self.X_pool[self.selected_indices]
+            # 使用已初始化的分析器，确保设备一致性
+            difference = self.analyzer.calculate_distribution_differences(
+                X_selected, self.X_test, self.weights, method="weighted_jsd"
+            )
+            reward = -difference  # 加权JS散度越小，奖励越大
+
+        # 检查是否完成
+        done = len(self.selected_indices) >= self.num_samples
+        if done:
+            self.state = np.ones(len(self.X_pool))
+        else:
+            self.state[action] = 1
+
+        return self.state, reward, done, {}
+
+    def reset(self):
+        """重置环境状态"""
+        self.selected_indices = []
+        self.state = np.zeros(len(self.X_pool))
+        return self.state
+
+# 训练DQN代理
+# 修改训练DQN代理函数，使用奖励收敛作为结束条件
+def train_dqn(env, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.001,
+              patience=10, min_reward_change=0.001, max_episodes=1500):
+    """
+    训练DQN代理，当奖励在指定轮数内变化小于阈值时停止训练，或达到最大轮数限制
+
+    参数:
+        patience: 允许奖励无显著变化的轮数
+        min_reward_change: 认为奖励无显著变化的阈值
+        max_episodes: 最大训练轮数限制
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+    input_dim = env.observation_space
+    output_dim = env.action_space
+    model = DQN(input_dim, output_dim, device)
+    target_model = DQN(input_dim, output_dim, device)
+    target_model.load_state_dict(model.state_dict())
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
+    memory = deque(maxlen=10000)
+
+    # 跟踪奖励和收敛判断变量
+    episode = 0
+    best_reward = -np.inf
+    no_improve_count = 0
+    recent_rewards = []
+    converged = False
+
+    # 修改点：在循环条件中加入最大轮数检查
+    while not converged and episode < max_episodes:
+        state = env.reset()
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        total_reward = 0
+        done = False
+
+        while not done:
+            if np.random.rand() <= epsilon:
+                # 随机选择动作
+                available_actions = [i for i in range(env.action_space)
+                                     if i not in env.selected_indices]
+                batch_size = min(env.batch_size, len(available_actions),
+                                 env.num_samples - len(env.selected_indices))
+                actions = np.random.choice(available_actions, size=batch_size, replace=False)
+            else:
+                # DQN预测
+                with torch.no_grad():
+                    q_values = model(state)
+                sorted_indices = torch.argsort(q_values, descending=True).squeeze().cpu().numpy()
+                available_actions = [i for i in sorted_indices
+                                     if i not in env.selected_indices]
+                batch_size = min(env.batch_size, len(available_actions),
+                                 env.num_samples - len(env.selected_indices))
+                actions = available_actions[:batch_size]
+
+            # 执行动作
+            next_state, reward, done, _ = env.step(actions)
+            next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+            total_reward += reward
+
+            # 存储经验
+            for action in actions:
+                memory.append((state.cpu().clone(), action, reward / len(actions),
+                               next_state.cpu().clone(), done))
+
+            state = next_state
+
+            # 经验回放训练
+            if len(memory) >= 32:
+                minibatch = random.sample(memory, 32)
+                states = torch.cat([s for s, _, _, _, _ in minibatch]).to(device)
+                actions = torch.tensor([a for _, a, _, _, _ in minibatch], dtype=torch.long).to(device)
+                rewards = torch.tensor([r for _, _, r, _, _ in minibatch], dtype=torch.float32).to(device)
+                next_states = torch.cat([ns for _, _, _, ns, _ in minibatch]).to(device)
+                dones = torch.tensor([d for _, _, _, _, d in minibatch], dtype=torch.float32).to(device)
+
+                # 计算当前Q值
+                q_values = model(states)
+                current_q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze()
+
+                # 计算目标Q值（Double DQN）
+                with torch.no_grad():
+                    next_q = model(next_states)
+                    next_actions = torch.argmax(next_q, dim=1)
+                    target_q = target_model(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
+                    target_q_values = rewards + (1 - dones) * gamma * target_q
+
+                # 计算损失并反向传播
+                loss = criterion(current_q_values, target_q_values)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        # 定期更新目标网络
+        if episode % 10 == 0:
+            target_model.load_state_dict(model.state_dict())
+
+        # 衰减探索率
+        epsilon = max(epsilon * epsilon_decay, epsilon_min)
+
+        # 跟踪最近奖励
+        recent_rewards.append(total_reward)
+        if len(recent_rewards) > patience:
+            recent_rewards.pop(0)
+
+        # 检查奖励是否收敛
+        if len(recent_rewards) == patience:
+            # 计算最近几轮的奖励变化
+            reward_changes = np.abs(np.diff(recent_rewards))
+            avg_change = np.mean(reward_changes)
+
+            # 如果平均变化小于阈值，认为已经收敛
+            if avg_change < min_reward_change:
+                converged = True
+                print(f"\n训练收敛！最近{patience}轮平均奖励变化: {avg_change:.6f}")
+
+        # 打印训练信息
+        if episode % 100 == 0:
+            print(f"Episode {episode + 1}, Total Reward: {total_reward:.2f}, "
+                  f"Epsilon: {epsilon:.3f}, Selected Samples: {len(env.selected_indices)}")
+
+        episode += 1
+
+    # 修改点：如果是因达到最大轮数而退出，打印提示信息
+    if episode >= max_episodes and not converged:
+        print(f"\n已达到最大训练轮数限制 ({max_episodes})，停止训练。")
+
+    return env.selected_indices
+
+# 定义加权距离计算函数
+def weighted_euclidean_distance(x1, x2, weights):
+    """
+    计算加权欧氏距离
+    参数:
+        x1: 第一个样本
+        x2: 第二个样本
+        weights: 特征权重
+    """
+    return np.sqrt(np.sum(weights * (x1 - x2) ** 2))
+
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.optim as optim
+from torch.distributions import MultivariateNormal
+from sklearn.neighbors import KernelDensity
+from sklearn.metrics import accuracy_score, recall_score, confusion_matrix, precision_score, f1_score
+from sklearn.ensemble import RandomForestClassifier
+from scipy import stats
+from scipy.interpolate import UnivariateSpline
+from typing import Dict, Tuple, Optional
+
+
+class DistributionAnalyzer:
+    """分布分析器，负责计算分布差异和影响量化分析，支持GPU加速"""
+
+    def __init__(self, flow_model: Optional[NormalizingFlow] = None, device=None):
+        """
+        初始化分布分析器
+
+        参数:
+            flow_model: 归一化流模型
+            device: 计算设备 (cuda或cpu)，默认自动选择
+        """
+        self.flow_model = flow_model
+        # 自动选择设备（优先GPU）
+        self.device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        print(f"DistributionAnalyzer 使用设备: {self.device}")
+
+    def set_flow_model(self, flow_model: NormalizingFlow) -> None:
+        """设置归一化流模型并确保其在正确设备上"""
+        self.flow_model = flow_model
+        self.flow_model.to(self.device)  # 确保流模型在指定设备上
+
+    def train_flow_model(self, X_train: np.ndarray, batch_size: int = 64,
+                         epochs: int = 500, lr: float = 0.001) -> None:
+        """
+        训练归一化流模型（在GPU上执行）
+
+        参数:
+            X_train: 训练数据
+            batch_size: 批量大小
+            epochs: 训练轮数
+            lr: 学习率
+        """
+        if self.flow_model is None:
+            raise ValueError("请先设置归一化流模型")
+
+        # 转换为PyTorch张量并移动到设备
+        X_train_tensor = torch.FloatTensor(X_train).to(self.device)
+
+        # 定义优化器
+        optimizer = optim.Adam(self.flow_model.parameters(), lr=lr)
+
+        # 训练循环
+        for epoch in range(epochs):
+            perm = torch.randperm(len(X_train_tensor), device=self.device)  # 在设备上生成随机排列
+            total_loss = 0
+
+            for i in range(0, len(X_train_tensor), batch_size):
+                batch_idx = perm[i:i + batch_size]
+                batch = X_train_tensor[batch_idx]
+
+                # 前向传播
+                optimizer.zero_grad()
+                log_prob = self.flow_model.log_prob(batch)
+                loss = -log_prob.mean()
+
+                # 反向传播
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * len(batch)
+
+            # 打印训练信息
+            if (epoch + 1) % 10 == 0:
+                avg_loss = total_loss / len(X_train_tensor)
+                print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
+
+        print("归一化流模型训练完成")
+
+    def _dequantize_data(self, X: np.ndarray) -> np.ndarray:
+        """
+        去量化处理：使用样条插值将离散数据转换为连续数据
+
+        参数:
+            X: 要处理的数据
+
+        返回:
+            去量化后的数据
+        """
+        df = pd.DataFrame(X)
+        columns = df.select_dtypes(include=[np.number]).columns.tolist()
+
+        for col in columns:
+            # 检查是否为离散数据
+            if df[col].nunique() < 20 and df[col].dtype != object:
+                # 获取唯一值及其频率
+                unique_values = df[col].unique()
+                counts = df[col].value_counts().sort_index()
+
+                # 创建样条插值函数
+                x = np.array(counts.index)
+                y = np.array(counts.values)
+
+                # 确保至少有3个点用于样条插值
+                if len(x) >= 3:
+                    try:
+                        # 平滑插值
+                        spl = UnivariateSpline(x, y, s=len(x) / 2)
+
+                        # 生成新的连续值
+                        new_x = np.linspace(x.min(), x.max(), 100)
+                        new_y = spl(new_x)
+
+                        # 确保所有值非负
+                        new_y = np.maximum(new_y, 0)
+
+                        # 检查是否所有值都是零
+                        if np.sum(new_y) == 0:
+                            print(f"警告: 列 {col} 的插值结果全为零，跳过去量化处理")
+                            continue
+
+                        # 归一化概率密度
+                        new_y = new_y / new_y.sum()
+
+                        # 从插值分布中采样
+                        indices = np.random.choice(len(new_x), size=len(df), p=new_y)
+                        new_values = new_x[indices]
+
+                        # 更新数据
+                        df[col] = new_values
+                    except Exception as e:
+                        print(f"处理列 {col} 时出错: {e}")
+                        continue
+
+        return df.values
+
+    def transform_data(self, X: np.ndarray) -> np.ndarray:
+        """
+        使用归一化流模型转换数据（在GPU上执行）
+
+        参数:
+            X: 输入数据
+
+        返回:
+            transformed_X: 转换后的数据（返回CPU上的numpy数组）
+        """
+        if self.flow_model is None:
+            raise ValueError("请先设置归一化流模型")
+
+        # 去量化处理
+        X = self._dequantize_data(X)
+
+        # 转换为PyTorch张量并移动到设备
+        X_tensor = torch.FloatTensor(X).to(self.device)
+
+        # 转换数据
+        self.flow_model.eval()
+        with torch.no_grad():  # 禁用梯度计算以提高效率
+            z, _ = self.flow_model(X_tensor)
+
+        # 将结果移回CPU并转换为numpy数组
+        return z.cpu().numpy()
+
+    def calculate_distribution_differences(self, X_train: np.ndarray, X_test: np.ndarray, weights=None,
+                                           method: str = None) -> float:
+        """
+        计算训练集和测试集之间的分布差异
+
+        参数:
+            X_train: 训练数据
+            X_test: 测试数据
+            method: 差异计算方法，可选"kl_divergence", "js_divergence", "mmd"
+
+        返回:
+            difference: 分布差异值
+        """
+        # 如果有归一化流模型，先转换数据
+        if self.flow_model is not None:
+            X_train_transformed = self.transform_data(X_train)
+            X_test_transformed = self.transform_data(X_test)
+        else:
+            X_train_transformed = X_train
+            X_test_transformed = X_test
+
+        # 根据选择的方法计算分布差异
+        if method == "kl_divergence":
+            return self._calculate_kl_divergence(X_train_transformed, X_test_transformed)
+        elif method == "energy_distance":
+            return self._calculate_energy_distance(X_train_transformed, X_test_transformed)
+        elif method == "mmd":
+            return self._calculate_mmd(X_train_transformed, X_test_transformed)
+        elif method == "jsd":
+            return self._calculate_JSD(X_train_transformed, X_test_transformed)
+        elif method == "weighted_jsd":
+            return self._calculate_weighted_JSD(X_train_transformed, X_test_transformed, weights)
+        else:
+            raise ValueError(f"不支持的方法: {method}")
+
+    def _calculate_kl_divergence(self, X1: np.ndarray, X2: np.ndarray) -> float:
+        """计算KL散度"""
+        # 对每个特征分别计算KL散度并求和
+        kl_div = 0
+        n_features = X1.shape[1]
+
+        for i in range(n_features):
+            # 估计概率密度
+            p = stats.gaussian_kde(X1[:, i])
+            q = stats.gaussian_kde(X2[:, i])
+
+            # 生成评估点
+            x_min = min(X1[:, i].min(), X2[:, i].min())
+            x_max = max(X1[:, i].max(), X2[:, i].max())
+            x = np.linspace(x_min, x_max, 100)
+
+            # 计算概率密度值
+            p_vals = p(x)
+            q_vals = q(x)
+
+            # 避免除零错误
+            mask = (p_vals > 1e-10) & (q_vals > 1e-10)
+            if np.sum(mask) > 0:
+                kl_div += np.sum(p_vals[mask] * np.log(p_vals[mask] / q_vals[mask])) * (x_max - x_min) / 100
+
+        return kl_div
+
+    def _calculate_mmd(self, X1: np.ndarray, X2: np.ndarray, gamma: float = 1.0) -> float:
+        """计算最大均值差异(MMD)，在GPU上执行"""
+        # 将numpy数组转换为PyTorch张量并移动到设备
+        X1_tensor = torch.FloatTensor(X1).to(self.device)
+        X2_tensor = torch.FloatTensor(X2).to(self.device)
+
+        # 计算MMD
+        n = X1_tensor.size(0)
+        m = X2_tensor.size(0)
+
+        # 计算核矩阵（在GPU上）
+        XX = self._compute_rbf_kernel(X1_tensor, X1_tensor, gamma)
+        YY = self._compute_rbf_kernel(X2_tensor, X2_tensor, gamma)
+        XY = self._compute_rbf_kernel(X1_tensor, X2_tensor, gamma)
+
+        # 计算MMD
+        mmd = torch.mean(XX) + torch.mean(YY) - 2 * torch.mean(XY)
+
+        # 返回CPU上的标量值
+        return mmd.item()
+
+    def _compute_rbf_kernel(self, X: torch.Tensor, Y: torch.Tensor, gamma: float) -> torch.Tensor:
+        """计算RBF核矩阵，确保在同一设备上执行"""
+        # 确保两个张量在同一设备
+        if X.device != Y.device:
+            Y = Y.to(X.device)
+
+        XX = torch.sum(X * X, dim=1).view(-1, 1)
+        YY = torch.sum(Y * Y, dim=1).view(1, -1)
+        dist = XX + YY - 2 * torch.matmul(X, Y.t())
+        return torch.exp(-gamma * dist)
+
+    def _calculate_energy_distance(self, X1: np.ndarray, X2: np.ndarray) -> float:
+        """计算能量距离"""
+        n = X1.shape[0]
+        m = X2.shape[0]
+
+        # 计算所有可能的欧几里得距离
+        XX = np.zeros((n, n))
+        YY = np.zeros((m, m))
+        XY = np.zeros((n, m))
+
+        for i in range(n):
+            for j in range(n):
+                XX[i, j] = np.linalg.norm(X1[i] - X1[j])
+
+        for i in range(m):
+            for j in range(m):
+                YY[i, j] = np.linalg.norm(X2[i] - X2[j])
+
+        for i in range(n):
+            for j in range(m):
+                XY[i, j] = np.linalg.norm(X1[i] - X2[j])
+
+        # 计算能量距离
+        term1 = (2.0 / (n * m)) * np.sum(XY)
+        term2 = (1.0 / (n * n)) * np.sum(XX)
+        term3 = (1.0 / (m * m)) * np.sum(YY)
+
+        return term1 - term2 - term3
+
+    def _calculate_JSD(self, X: np.ndarray, Y: np.ndarray, bandwidth=0.5, n_samples=500):
+        """计算两个样本集之间的JS散度"""
+        n_features = X.shape[1]
+        total_js = 0
+
+        # 生成用于评估密度的样本点（使用两个分布的混合）
+        combined = np.vstack([X, Y])
+        sample_points = combined[np.random.choice(len(combined), n_samples)]
+
+        for i in range(n_features):
+            # 对每个特征进行KDE
+            kde_p = KernelDensity(bandwidth=bandwidth).fit(X[:, i].reshape(-1, 1))
+            kde_q = KernelDensity(bandwidth=bandwidth).fit(Y[:, i].reshape(-1, 1))
+
+            # 计算对数密度
+            log_p = kde_p.score_samples(sample_points[:, i].reshape(-1, 1))
+            log_q = kde_q.score_samples(sample_points[:, i].reshape(-1, 1))
+
+            # 转换为概率密度
+            p = np.exp(log_p)
+            q = np.exp(log_q)
+
+            # 归一化（确保积分为1）
+            p = p / np.sum(p)
+            q = q / np.sum(q)
+
+            # 计算中点分布
+            m = 0.5 * (p + q)
+
+            # 计算JS散度
+            kl_pm = np.sum(p * np.log(p / m, out=np.zeros_like(p), where=(p > 0) & (m > 0)))
+            kl_qm = np.sum(q * np.log(q / m, out=np.zeros_like(q), where=(q > 0) & (m > 0)))
+            js = 0.5 * (kl_pm + kl_qm)
+
+            total_js += js
+
+        return total_js / n_features  # 返回平均JS散度
+
+    def _calculate_weighted_JSD(self, X: np.ndarray, Y: np.ndarray, weights, bandwidth=0.5, n_samples=500):
+        """计算两个样本集之间的加权JS散度"""
+        n_features = X.shape[1]
+        total_js = 0
+
+        # 生成用于评估密度的样本点（使用两个分布的混合）
+        combined = np.vstack([X, Y])
+        sample_points = combined[np.random.choice(len(combined), n_samples)]
+
+        for i in range(n_features):
+            # 对每个特征进行KDE
+            kde_p = KernelDensity(bandwidth=bandwidth).fit(X[:, i].reshape(-1, 1))
+            kde_q = KernelDensity(bandwidth=bandwidth).fit(Y[:, i].reshape(-1, 1))
+
+            # 计算对数密度
+            log_p = kde_p.score_samples(sample_points[:, i].reshape(-1, 1))
+            log_q = kde_q.score_samples(sample_points[:, i].reshape(-1, 1))
+
+            # 转换为概率密度
+            p = np.exp(log_p)
+            q = np.exp(log_q)
+
+            # 归一化（确保积分为1）
+            p = p / np.sum(p)
+            q = q / np.sum(q)
+
+            # 计算中点分布
+            m = 0.5 * (p + q)
+
+            # 计算JS散度
+            kl_pm = np.sum(p * np.log(p / m, out=np.zeros_like(p), where=(p > 0) & (m > 0)))
+            kl_qm = np.sum(q * np.log(q / m, out=np.zeros_like(q), where=(q > 0) & (m > 0)))
+            js = 0.5 * (kl_pm + kl_qm)
+            weight = weights[i]
+            total_js += js * weight
+
+        return total_js  # 返回加权JS散度
+
+    def analyze_impact(self, X_train: np.ndarray, X_test: np.ndarray, y_train: np.ndarray,
+                       y_test: np.ndarray, model_type: str = "random_forest") -> Dict[str, float]:
+        """
+        评估分布差异对模型性能的影响
+
+        参数:
+            X_train: 训练数据
+            X_test: 测试数据
+            y_train: 训练标签
+            y_test: 测试标签
+            model_type: 模型类型，可选"random_forest", "logistic_regression"
+
+        返回:
+            metrics: 模型性能指标
+        """
+        # 创建模型
+        if model_type == "random_forest":
+            model = RandomForestClassifier(n_estimators=1000, random_state=42)
+        elif model_type == "logistic_regression":
+            from sklearn.linear_model import LogisticRegression
+            model = LogisticRegression(random_state=42)
+        elif model_type == "svm":
+            from sklearn.svm import SVC
+            model = SVC(random_state=42, probability=True)  # 设置probability=True以启用predict_proba
+        else:
+            raise ValueError(f"不支持的模型类型: {model_type}")
+
+        # 训练模型
+        model.fit(X_train, y_train)
+
+        # 预测
+        y_pred = model.predict(X_test)
+
+        # 计算性能指标
+        accuracy = accuracy_score(y_test, y_pred)
+        recall = recall_score(y_test, y_pred, pos_label=1)
+        tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+        fpr = fp / (fp + tn)  # 假阳性率
+        precision = precision_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+
+        return {
+            "accuracy": accuracy,
+            "recall": recall,
+            "false_positive_rate": fpr,
+            "true_positive_rate": tp / (tp + fn),
+            "precision": precision,
+            "f1_score": f1
+        }
+
+    def weighted_minkowski_distance(self, x: np.ndarray, y: np.ndarray, weights: np.ndarray, p: float) -> float:
+        """
+        计算加权Minkowski距离
+
+        参数:
+            x: 第一个样本
+            y: 第二个样本
+            weights: 特征权重向量
+            p: Minkowski参数 (p=1: Manhattan, p=2: Euclidean)
+
+        返回:
+            加权Minkowski距离
+        """
+        # 确保输入有效
+        if len(x) != len(y) or len(x) != len(weights):
+            raise ValueError("输入向量和权重必须具有相同的维度")
+
+        # 计算加权Minkowski距离
+        return np.sum(weights * np.abs(x - y) ** p) ** (1 / p)
+
+    def optimize_training_set_selection(self, X_pool: np.ndarray, y_pool: np.ndarray,
+                                        X_test: np.ndarray, weights: np.ndarray, num_samples):
+        """
+        优化训练集选择，使用强化学习根据加权JS散度选择数据
+
+        参数:
+            X_pool: 数据池
+            y_pool: 数据池标签
+            X_test: 测试数据
+            weights: 特征权重
+            num_samples: 要选择的样本数
+
+        返回:
+            X_selected: 选择的训练数据
+            y_selected: 选择的训练标签
+        """
+        # 确保环境使用相同的设备
+        env = WeightOptimizationEnv(X_pool, y_pool, X_test, weights, num_samples, device=self.device)
+        selected_indices = train_dqn(env)
+        return X_pool[selected_indices], y_pool[selected_indices]
+
+
+class Visualizer:
+
+    def plot_feature_importance(self, feature_importance: pd.DataFrame, top_n: int = 10) -> None:
+        """
+        绘制特征重要性图
+
+        参数:
+            feature_importance: 特征重要性数据框
+            top_n: 显示前n个特征
+        """
+        plt.figure(figsize=(10, 6))
+        top_features = feature_importance.sort_values('importance', ascending=False).head(top_n)
+        sns.barplot(x='importance', y='feature', data=top_features)
+        plt.title('特征重要性')
+        plt.tight_layout()
+        plt.show()
+
+    def plot_distribution_comparison(self, X_train: np.ndarray, X_test: np.ndarray,
+                                     feature_names: List[str], feature_indices: List[int] = None) -> None:
+        """
+        绘制训练集和测试集特征分布比较图
+
+        参数:
+            X_train: 训练数据
+            X_test: 测试数据
+            feature_names: 特征名称列表
+            feature_indices: 要绘制的特征索引列表，如果为None则绘制前5个特征
+        """
+        if feature_indices is None:
+            feature_indices = list(range(min(5, X_train.shape[1])))
+
+        plt.figure(figsize=(15, 10))
+
+        for i, idx in enumerate(feature_indices):
+            plt.subplot(2, 3, i + 1)
+            sns.kdeplot(X_train[:, idx], label='trainset')
+            sns.kdeplot(X_test[:, idx], label='testset')
+            plt.title(f'{feature_names[idx]} distribution')
+            plt.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_performance_comparison(self, metrics_before: Dict[str, float],
+                                    metrics_after: Dict[str, float]) -> None:
+        """
+        绘制优化前后模型性能比较图
+
+        参数:
+            metrics_before: 优化前的性能指标
+            metrics_after: 优化后的性能指标
+        """
+        metrics = list(metrics_before.keys())
+        values_before = list(metrics_before.values())
+        values_after = list(metrics_after.values())
+
+        x = np.arange(len(metrics))
+        width = 0.35
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(x - width / 2, values_before, width, label='优化前')
+        plt.bar(x + width / 2, values_after, width, label='优化后')
+
+        plt.ylabel('分数')
+        plt.title('模型性能比较')
+        plt.xticks(x, metrics)
+        plt.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+
+def cluster_based_oversampling(X_minority, n_samples, n_clusters=5, random_state=42):
+    # 对少数类样本进行聚类
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state)
+    clusters = kmeans.fit_predict(X_minority)
+
+    # 计算每个簇需要生成的样本数（按簇大小比例分配）
+    cluster_counts = Counter(clusters)
+    total_minority = len(X_minority)
+    synthetic_per_cluster = {}
+
+    for cluster, count in cluster_counts.items():
+        ratio = count / total_minority
+        synthetic_per_cluster[cluster] = int(round(ratio * n_samples))
+
+    # 确保总样本数与目标一致
+    total_generated = sum(synthetic_per_cluster.values())
+    if total_generated != n_samples:
+        diff = n_samples - total_generated
+        largest_cluster = max(cluster_counts, key=lambda k: cluster_counts[k])
+        synthetic_per_cluster[largest_cluster] += diff
+
+    # 在每个簇内生成样本
+    X_synthetic = []
+    for cluster in range(n_clusters):
+        if synthetic_per_cluster.get(cluster, 0) <= 0:
+            continue
+
+        cluster_samples = X_minority[clusters == cluster]
+        n_synthetic = synthetic_per_cluster[cluster]
+
+        # 处理簇中样本数量不同的情况
+        if len(cluster_samples) == 1:
+            # 只有一个样本时，直接复制
+            synthetic = np.repeat(cluster_samples, n_synthetic, axis=0)
+        elif len(cluster_samples) < 5:  # 样本较少时，使用随机过采样
+            # 随机选择样本进行复制
+            indices = np.random.choice(len(cluster_samples), size=n_synthetic, replace=True)
+            synthetic = cluster_samples[indices]
+        else:
+            # 样本足够时，使用SMOTE，但创建至少两个类别的标签
+            # 这里使用聚类中心距离作为伪标签，确保至少有两个类别
+            distances = np.linalg.norm(cluster_samples - kmeans.cluster_centers_[cluster], axis=1)
+            # 将样本分为两类：距离中心较近和较远
+            threshold = np.median(distances)
+            temp_y = (distances > threshold).astype(int)  # 0和1两个类别
+
+            # 使用SMOTE生成样本
+            smote = SMOTE(
+                sampling_strategy='auto',
+                random_state=random_state
+            )
+            # 计算需要生成到多少样本
+            target_count = len(cluster_samples) + n_synthetic
+            # 确保两个类别都有足够样本
+            class_counts = Counter(temp_y)
+            min_class = min(class_counts, key=class_counts.get)
+            if class_counts[min_class] < 2:
+                # 如果某个类别样本太少，调整伪标签
+                temp_y[np.argsort(distances)[:2]] = min_class
+
+            # 应用SMOTE
+            X_res, y_res = smote.fit_resample(cluster_samples, temp_y)
+            # 提取新生成的样本
+            synthetic = X_res[len(cluster_samples):]
+            # 如果生成的样本超过需要，截断；如果不足，补充随机采样
+            if len(synthetic) > n_synthetic:
+                synthetic = synthetic[:n_synthetic]
+            elif len(synthetic) < n_synthetic:
+                remaining = n_synthetic - len(synthetic)
+                indices = np.random.choice(len(cluster_samples), size=remaining, replace=True)
+                synthetic = np.vstack([synthetic, cluster_samples[indices]])
+
+        X_synthetic.append(synthetic)
+
+    return np.vstack(X_synthetic)
+
+def main():
+    # 示例：使用Promise数据集进行软件缺陷预测
+    # 初始化数据处理器
+    data_processor = DataProcessor(dataset_name="kc1")
+    # 加载数据
+    data = data_processor.load_data()
+    # 特征选择
+    # data_processor.select_features()
+    # 准备训练集和测试集
+    data_processor.prepare_data()
+
+    # 获取处理后的数据
+    X_train, X_test = data_processor.X_train, data_processor.X_test
+    y_train, y_test = data_processor.y_train, data_processor.y_test
+
+    # 初始化归一化流模型
+    flow_model = NormalizingFlow(dim=X_train.shape[1])
+
+    # 初始化分布分析器
+    analyzer = DistributionAnalyzer(flow_model)
+
+    # 训练归一化流模型
+    analyzer.train_flow_model(X_train)
+
+    # 6. 获取用于比较的半训练集
+    X_half1, X_half2, y_half1, y_half2 = train_test_split(
+        X_train, y_train, test_size=0.5, random_state=42  # random_state确保结果可复现
+    )
+
+    # env = WeightOptimizationEnv(X_train, y_train, X_test, y_test)
+    # # 训练强化学习代理
+    # print("\n开始训练强化学习代理...")
+    # optimal_weights = train_dqn(env)
+    # print("\n训练完成，优化后的权重:")
+
+    #
+    # jedit-3.2: 0.0104,0.2022,0.0375,0.0161,0.0219,0.0337,0.0144,0.0030,0.0033,0.0059,0.0108,0.0556,0.0611,0.0233,0.2757, 0.1081,0.0464,0.0172,0.0291,0.0244
+    # jedit-4.0: 0.1598,0.0942,0.1175,0.0266,0.0162,0.0557,0.0025,0,0.0010,0.0060,0.0054,0.0688,0.0005,0.0281,0.0182,0.0889,0.0209,0,0.0831,0.2067
+    # jedit-4.1: 0.0284, 0.0437, 0.0617, 0.0011, 0.0444, 0.1086, 0.0292, 0.0111, 0.1940, 0.0181, 0.0819, 0.0007, 0.1340, 0.0481, 0.0182, 0.0289, 0.0096, 0.0635, 0.0322, 0.0426
+    # camel-1.2: 0.0017,0.0209,0.0903,0.0030,0.0257,0.0298,0.1009,0.0842,0.0023,0.0448,0.0575,0.0151,0.0382,0.2349,0.0915,0.0468,0.0157,0.0798,0.0002,0.0167
+    # camel-1.4: 0.0701,0.0866,0.0394,0.0000,0.0587,0.1048,0.0108,0.0483,0.0418,0.0757,0.0911,0.0705,0.0005,0.0548,0.0611,0.1323,0.0119,0.0001,0.0077,0.0257
+    # ant-1.3:   0.0885,0.0439,0.0146,0.1504,0.0158,0.0212,0.0321,0.0624,0.0009,0.0339,0.0253,0.0143,0.0817,0.1105,0.0374,0.1312,0.0241,0.0000,0.0109,0.1008
+    # ant-1.4:   0.0229,0.1117,0.0306,0.0015,0.032,0.06,0.0117,0.0069,0.0737,0.0561,0.0058,0.0309,0.0218,0.0564,0.0671,0.1456,0.2483,0.0,0.0002,0.0167
+    # log4j-1.0： 0.0017,0.0313,0.0378,0.1345,0.0735,0.0731,0.0822,0.0064,0.036,0.0593,0.0011,0.0649,0.1112,0.0258,0.1092,0.0739,0.0333,0.0022,0.0123,0.0303
+    # log4j-1.1： 0.0018,0.0084,0.0486,0.0199,0.0127,0.0169,0.0003,0.0706,0.0317,0.0282,0.0011,0.041,0.0006,0.0746,0.2247,0.0152,0.0011,0.2797,0.0485,0.0745
+    # log4j-1.2： 0.0349,0.0002,0.0524,0.0007,0.0802,0.0283,0.0919,0.0,0.0971,0.0232,0.0633,0.0437,0.0565,0.0312,0.0732,0.0593,0.009,0.0646,0.0382,0.1522
+    # wmc,dit,noc,cbo,rfc,lcom,ca,ce,npm,lcom3,loc,dam,moa,mfa,cam,ic,cbm,amc,max_cc,avg_cc,
+    optimal_weights = [0.0017,0.0209,0.0903,0.0030,0.0257,0.0298,0.1009,0.0842,0.0023,0.0448,0.0575,0.0151,0.0382,0.2349,0.0915,0.0468,0.0157,0.0798,0.0002,0.0167]
+    print(optimal_weights)
+
+    # 计算分布差异
+    ed = analyzer.calculate_distribution_differences(X_half1, X_test, method="energy_distance")
+    jsd = analyzer.calculate_distribution_differences(X_half1, X_test, method="jsd")
+    mmd = analyzer.calculate_distribution_differences(X_half1, X_test, method="mmd")
+    weighted_jsd = analyzer.calculate_distribution_differences(X_half1, X_test, optimal_weights, method="weighted_jsd")
+    print(f"\n优化前能量距离：{ed:.4f} MMD: {mmd:.4f}  JSD: {jsd:.4f} weighted-JSD: {weighted_jsd:.4f}")
+
+    # 分析分布差异对模型性能的影响
+    metrics_before = analyzer.analyze_impact(X_half1, X_test, y_half1, y_test)
+    print("优化前模型性能指标:")
+    for metric, value in metrics_before.items():
+        print(f"{metric}: {value:.4f}")
+
+    # 优化训练集选择
+    X_pool = np.vstack([X_train, X_test])
+    y_pool = np.hstack([y_train, y_test])
+    # X_pool = X_train
+    # y_pool = y_train
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X_pool, y_pool)
+
+    X_selected, y_selected = analyzer.optimize_training_set_selection(
+        X_res, y_res, X_test, optimal_weights, num_samples=4 * len(X_test))
+
+    selected_defect_count = np.sum(y_selected == 1)
+    print(f"\n筛选后训练集缺陷占比：{selected_defect_count}/{4 * len(X_test)}")
+
+    ed = analyzer.calculate_distribution_differences(X_selected, X_test, method="energy_distance")
+    jsd = analyzer.calculate_distribution_differences(X_selected, X_test, method="jsd")
+    mmd = analyzer.calculate_distribution_differences(X_selected, X_test, method="mmd")
+    weighted_jsd = analyzer.calculate_distribution_differences(X_selected, X_test, optimal_weights,method="weighted_jsd")
+
+    print(f"\n优化后能量距离：{ed:.4f} MMD: {mmd:.4f}  JSD: {jsd:.4f} weighted-JSD: {weighted_jsd:.4f}")
+    # 使用优化后的训练集重新评估模型性能
+    metrics_after = analyzer.analyze_impact(X_selected, X_test, y_selected, y_test)
+    print("优化后模型性能指标:")
+    for metric, value in metrics_after.items():
+        print(f"{metric}: {value:.4f}")
+
+    # SMOTE优化，以进行对比实验
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X_train, y_train)
+    metrics_aftersmote = analyzer.analyze_impact(X_res, X_test, y_res, y_test)
+    print("\nSMOTE优化后模型性能指标:")
+    for metric, value in metrics_aftersmote.items():
+        print(f"{metric}: {value:.4f}")
+
+
+
+if __name__ == "__main__":
+    main()
